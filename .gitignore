@@ -7,3 +7,7 @@ logs/
 .venv/
 venv/
 .DS_Store
+build/
+*.so
+*.egg-info/
+fo_engine*.so
