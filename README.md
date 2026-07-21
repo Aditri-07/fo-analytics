@@ -9,8 +9,8 @@ query layer over simulated front-office data.
 - [x] Step 2 — ETL + validation
 - [x] **Step 3 — Analytics layer** (this commit)
 - [x] Step 4 — LLM natural-language query layer
-- [ ] Step 5 — C++ analytics engine + pybind11 bindings
-- [ ] Step 6 — Dashboard
+- [x] Step 5 — C++ analytics engine + pybind11 bindings
+- [x] Step 6 — Dashboard (modifications required)
 
 ## Quick start
 
