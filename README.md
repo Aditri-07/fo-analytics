@@ -1,123 +1,154 @@
-# Front-Office Workflow & Analytics System
+# Sales & Trading Analytics Platform
 
-Trade lifecycle management, portfolio/sales analytics, ETL, and an LLM
-query layer over simulated front-office data.
+A front-office trade analytics platform: full trade lifecycle modeling, a validated
+data pipeline, portfolio and sales analytics, an LLM natural-language query layer,
+and a performance-critical engine ported to C++ — built on simulated market data.
 
-## Status
+> **Note on data:** All data is simulated. Real front-office trade flow is
+> confidential, so a seeded generator produces realistic trading activity (tiered
+> clients, asset-class preferences, dirty feeds) to run the system against. The
+> pipeline, analytics, and engine are production-shaped and would run unchanged on
+> real feeds.
 
-- [x] Step 1 — Data model, feed simulator, SQL schema
-- [x] Step 2 — ETL + validation
-- [x] **Step 3 — Analytics layer** (this commit)
-- [x] Step 4 — LLM natural-language query layer
-- [x] Step 5 — C++ analytics engine + pybind11 bindings
-- [x] Step 6 — Dashboard (modifications required)
+## What it does
+
+The system models how a trading desk's analytics infrastructure is organized, in
+five layers:
+
+- **Trade lifecycle** — event-sourced model of trades, orders, positions,
+  portfolios, and clients across equities, fixed income, FX, and commodities.
+  Booking, amendments, and cancellations flow as events to an immutable audit log;
+  current positions are derived from the event stream.
+- **Data pipeline (ETL)** — raw feeds land in a staging area, pass through 14
+  data-quality checks, and only clean records are promoted. Idempotent and
+  crash-safe.
+- **Analytics** — deterministic, unit-tested functions over the database: P&L,
+  exposure/netting, concentration, turnover, client activity, and dormancy.
+- **AI query layer** — plain-English questions are routed by an LLM to the correct
+  analytics function. The model selects and parameterizes; all numbers come from
+  the data, never the model.
+- **C++ engine** — the performance-critical position/P&L loop, ported to C++ via
+  pybind11 and validated to match the Python implementation exactly.
+
+## Architecture
+
+```
+FeedGenerator ──► JSONL feeds (NEW / AMEND / CANCEL, ~4% dirty rows)
+                        │
+                        ▼  ETL: validate + promote
+              raw_trade_events ──► trade_events (audit) ──► trades (state)
+                        │                                      │
+                        ▼                                      ▼
+                   dq_issues                            positions_eod ◄── marks
+                        │                                      │
+                        └──────────► analytics layer ◄─────────┘
+                                          │
+                        ┌─────────────────┼─────────────────┐
+                        ▼                 ▼                 ▼
+                   C++ engine        LLM query          dashboard
+                   (pybind11)         layer
+```
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-python run_all.py            # simulate -> ETL -> analytics, one command
-python -m pytest tests/ -q   # 45 tests
+python run_all.py            # simulate → ETL → analytics, one command
+python -m pytest tests/ -q   # 46 tests
 ```
 
-`python run_all.py --fresh` wipes `data/` and rebuilds from scratch
-(do this after changing any logic that affects stored values).
-Stages can also be run individually, in order:
+Individual stages, in order:
 
 ```bash
-python run_simulator.py --days 20 --clients 25 --seed 42   # 1. generate feeds
-python run_etl.py                                          # 2. load -> validate -> promote
-python run_analytics.py                                    # 3. marks + snapshots + report
+python run_simulator.py --days 20 --clients 25 --seed 42   # generate feeds + DB
+python run_etl.py                                          # load → validate → promote
+python run_analytics.py                                    # marks, snapshots, report
 ```
 
-Outputs:
-- `data/feeds/trade_events_YYYY-MM-DD.jsonl` — daily lifecycle event feeds
-- `data/feeds/clients.csv`, `instruments.csv` — reference data
-- `data/fo_analytics.db` — SQLite DB with schema + reference data loaded
+### Natural-language queries (optional)
 
-## Architecture (step 1)
-
-```
-FeedGenerator ──► JSONL event feeds (NEW/AMEND/CANCEL, ~4% dirty rows)
-                        │
-                        ▼            (step 2: ETL validates + promotes)
-              raw_trade_events ──► trade_events (audit) ──► trades (state)
-                                                        └─► positions_eod
-```
-
-Design decisions:
-- **Event-sourced trades.** The feed carries lifecycle events; `trades`
-  is derived current state, `trade_events` is the immutable audit trail.
-- **Simulator writes files, not the DB.** Mirrors real feed handling and
-  gives the ETL (step 2) a genuine ingestion boundary to validate at.
-- **Dirty data by design.** Duplicates, missing fields, bad values,
-  unknown references, stale timestamps, malformed JSON — injected at
-  configurable rates so validation has real work to do.
-- **Client profiles drive behaviour.** Tiered activity levels,
-  asset-class preferences, dormancy — patterns the sales analytics in
-  step 3 should rediscover from the data alone.
-- **WAC position keeping** with realized/unrealized P&L split and
-  correct flip-through-zero handling; amendments/cancels replay
-  economics so positions stay consistent.
-
-## ETL (step 2)
+Requires a Gemini API key. Everything else runs without it.
 
 ```bash
-FO_ENV=dev python run_etl.py     # load -> validate -> promote
+export GEMINI_API_KEY=your-key
+python run_query.py "which clients increased fixed-income activity this month?"
+python run_query.py "who are my dormant clients?"
 ```
 
-- **Landing zone first.** Raw lines are stored verbatim in
-  `raw_trade_events`; parsing and validation never happen at ingestion.
-- **12 REJECT rules + 2 WARN rules** with stable codes
-  (`DUPLICATE_EVENT`, `ORPHAN_EVENT`, `VERSION_OUT_OF_SEQUENCE`,
-  `AMEND_AFTER_CANCEL`, ...). Rejects go to `dq_issues` and are never
-  promoted; warns (e.g. `STALE_TIMESTAMP`) are flagged but promoted.
-- **Lifecycle-aware validation.** The validator tracks per-trade
-  version/status, so it catches orphaned amends, amend-after-cancel,
-  version gaps, and duplicate lifecycle events — including *cascade*
-  rejections (a rejected NEW orphans all its later events).
-- **Idempotent + transactional.** Re-running loads nothing twice and
-  re-promotes nothing; the whole run is one transaction, so a crash
-  leaves the DB untouched.
-- **Environments as config.** `FO_ENV=dev|uat|prod` selects DB/feed
-  paths and log level (`fo/config.py`); rotating-file logging in
-  `fo/logging_setup.py`.
+### C++ engine
 
-## Analytics (step 3)
+Requires a C++ compiler.
 
-- **EOD snapshots** replay the `trade_events` audit log through the
-  same `Position` class as the OOP model (WAC, flip-through-zero,
-  amend/cancel reverse-and-replay) and write `positions_eod` per day.
-  Replay is in audit order with day-clamping: backdated (stale-WARN)
-  events apply on the processing day, never retroactively.
-- **Marks** = last traded price per instrument/day with carry-forward
-  (`marks_eod`, source column records carried days). A proxy for
-  vendor closes; swap in real EOD data later without touching callers.
-- **Portfolio analytics** (`fo/analytics/portfolio.py`): P&L summary,
-  net/gross exposure, concentration, turnover, top movers, asset-class
-  breakdown, daily P&L series.
-- **Sales analytics** (`fo/analytics/sales.py`): client activity with
-  prior-period comparison, product preferences, dormant clients,
-  weekly trends, opportunity flags (FADING, SINGLE_PRODUCT) with
-  human-readable reasons.
-- All functions take `(conn, plain params)` and return JSON-serializable
-  rows — they are the LLM's tool set in step 4.
-- **Conventions:** notional/exposure in USD per asset-class convention
-  (FI clean/100, commodity contract size, USD-base FX = base qty);
-  USD-base FX P&L converted from quote ccy at the day's mark.
-  Known simplifications: no accrued interest on bonds, no funding or
-  fees, marks are trade prints not vendor closes.
-- **Ground-truth test:** dormancy detection provably recovers the
-  simulator's hidden dormant-client profiles from the data alone.
+```bash
+pip install pybind11
+pip install -e .              # compiles the C++ module
+python run_benchmark.py       # Python vs C++ on identical data
+```
+
+The engine is validated to match the Python implementation exactly
+(`tests/test_engine.py`).
+
+### Dashboard
+
+```bash
+streamlit run dashboard.py    # opens localhost:8501
+```
+
+Interactive views for P&L, exposure, client analytics, and the natural-language
+query box. Set `GEMINI_API_KEY` before launching for the query tab.
+
+## Design decisions worth knowing
+
+- **Event-sourced trades.** The feed carries lifecycle events; `trades` is derived
+  current state and `trade_events` is the immutable audit trail (unique on
+  trade-id + version). Amendments and cancellations are applied as
+  reverse-and-replay, so positions stay exact.
+- **The simulator writes files, not the database.** This creates a real ingestion
+  boundary for the ETL to validate at — mirroring how feed handling actually works.
+- **Dirty data by design.** The generator injects duplicates, missing fields, bad
+  values, unknown references, stale timestamps, and malformed JSON at configurable
+  rates, so validation has genuine work to do. Rejections cascade correctly — a
+  rejected NEW event orphans its later amendments and cancellations.
+- **Weighted-average-cost position keeping** with a realized/unrealized P&L split
+  and correct flip-through-zero handling (a position crossing zero re-opens at the
+  fill price).
+- **Asset-class-specific notional conventions** — bond clean price × face / 100,
+  commodity contract size, USD-base FX where the USD leg is the base quantity.
+- **The LLM never computes.** It chooses which analytics function to call and with
+  what parameters; the Python code produces every number. This keeps output
+  validated and reproducible.
+
+## Testing
+
+46 unit tests with CI (GitHub Actions), including:
+
+- Trade lifecycle and position-keeping edge cases (flips, amends, cancels)
+- Every data-quality validation rule
+- End-to-end pipeline reconciliation
+- A ground-truth test that recovers 100% of the simulator's hidden dormant-client
+  profiles from the data alone
+- C++ / Python reconciliation to machine precision
 
 ## Layout
 
 ```
 fo/
-  models/    enums.py, trade.py (Trade + 4 asset-class subclasses),
-             portfolio.py (Client, Order, Position, Portfolio)
-  db/        schema.sql, database.py (bootstrap + reference load)
-  simulator/ feed_generator.py
-tests/       test_models.py (13 tests)
-run_simulator.py
+  models/     enums, trade hierarchy, client/order/position/portfolio
+  db/         schema.sql, database bootstrap
+  simulator/  feed generator
+  etl/        loader, validator (14 rules), pipeline
+  analytics/  marks, snapshots, portfolio, sales
+  ai/         LLM tool definitions + query agent
+  engine/     Python wrapper for the C++ module
+cpp/          engine.cpp (pybind11)
+tests/        46 tests
+dashboard.py  Streamlit dashboard
+run_*.py      simulator, ETL, analytics, query, benchmark, all
 ```
+
+## Known simplifications
+
+Simulated data throughout. No accrued interest on bonds; FX quoted against USD;
+marks are trade prints rather than vendor closes; DEV/UAT/PROD are config profiles,
+not real infrastructure. These are scoped deliberately — the goal is correct
+machinery, not a production trading system.
