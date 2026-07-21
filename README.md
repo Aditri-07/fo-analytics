@@ -8,7 +8,7 @@ query layer over simulated front-office data.
 - [x] Step 1 — Data model, feed simulator, SQL schema
 - [x] Step 2 — ETL + validation
 - [x] **Step 3 — Analytics layer** (this commit)
-- [ ] Step 4 — LLM natural-language query layer
+- [x] Step 4 — LLM natural-language query layer
 - [ ] Step 5 — C++ analytics engine + pybind11 bindings
 - [ ] Step 6 — Dashboard
 
